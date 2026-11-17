@@ -191,6 +191,9 @@ type egressMockClient struct {
 	mintCalls atomic.Int32
 	lastMint  atomic.Pointer[ateapi.MintActorJwtRequest]
 	mintErr   error
+	// mintGate, when non-nil, blocks each MintActorJwt until it is closed or
+	// its ctx ends.
+	mintGate chan struct{}
 }
 
 func (m *egressMockClient) GetActor(context.Context, *ateapi.GetActorRequest, ...grpc.CallOption) (*ateapi.Actor, error) {
@@ -221,9 +224,16 @@ func (m *egressMockClient) GetActorEgressPolicy(ctx context.Context, req *ateapi
 	return m.policy, nil
 }
 
-func (m *egressMockClient) MintActorJwt(_ context.Context, req *ateapi.MintActorJwtRequest, _ ...grpc.CallOption) (*ateapi.MintActorJwtResponse, error) {
+func (m *egressMockClient) MintActorJwt(ctx context.Context, req *ateapi.MintActorJwtRequest, _ ...grpc.CallOption) (*ateapi.MintActorJwtResponse, error) {
 	n := m.mintCalls.Add(1)
 	m.lastMint.Store(req)
+	if m.mintGate != nil {
+		select {
+		case <-m.mintGate:
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	}
 	if m.mintErr != nil {
 		return nil, m.mintErr
 	}

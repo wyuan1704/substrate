@@ -16,7 +16,14 @@ package steps
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
+	"math/big"
 	"os"
 	"reflect"
 	"slices"
@@ -1707,16 +1714,66 @@ func TestRequireTokenExchangeCA(t *testing.T) {
 		wantErr   bool
 	}{
 		{name: "unset"},
-		{name: "present", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"ca.crt": "pem"}, nil)}},
-		{name: "present as binary data", configMap: "corp-ca", objects: []runtime.Object{configMap(nil, map[string]string{"ca.crt": "der"})}},
+		{name: "present", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"ca.crt": testCAPEM(t)}, nil)}},
+		{name: "not PEM", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"ca.crt": "pem"}, nil)}, wantErr: true},
+		{name: "a PEM block that is not a certificate", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"ca.crt": "-----BEGIN CERTIFICATE-----\nbm90IGEgY2VydA==\n-----END CERTIFICATE-----\n"}, nil)}, wantErr: true},
+		{name: "as binary data", configMap: "corp-ca", objects: []runtime.Object{configMap(nil, map[string]string{"ca.crt": "der"})}, wantErr: true},
+		{name: "PEM as binary data", configMap: "corp-ca", objects: []runtime.Object{configMap(nil, map[string]string{"ca.crt": testCAPEM(t)})}, wantErr: true},
 		{name: "missing", configMap: "corp-ca", wantErr: true},
-		{name: "without ca.crt", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"tls.crt": "pem"}, nil)}, wantErr: true},
+		{name: "without ca.crt", configMap: "corp-ca", objects: []runtime.Object{configMap(map[string]string{"tls.crt": testCAPEM(t)}, nil)}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := &Env{Cfg: &config.Config{Root: repoRoot(t), TokenExchangeCAConfigMap: tc.configMap}, Kube: fakeKube(t, tc.objects...)}
 			err := e.requireTokenExchangeCA(t.Context())
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("requireTokenExchangeCA() = %v, want error %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// testCAPEM is a self-signed CA certificate in PEM.
+func testCAPEM(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// A running atenet-egress reads the token exchange CA only at startup, and a
+// change to the ConfigMap leaves the pod template as it was, so every apply
+// with the setting restarts it.
+func TestAtenetEgressRestartOnApply(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		cfg       config.Config
+		providers []config.CredentialProvider
+		want      bool
+	}{
+		{name: "nothing read at startup"},
+		{name: "additional ext_proc service", cfg: config.Config{AdditionalEgressExtprocService: "ns/svc:9000"}, want: true},
+		{name: "credential provider", providers: []config.CredentialProvider{{Name: "k8s.io"}}, want: true},
+		{name: "token exchange CA", cfg: config.Config{TokenExchangeCAConfigMap: "corp-ca"}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Env{Cfg: &tc.cfg}
+			if got := e.atenetEgressRestartOnApply(tc.providers); got != tc.want {
+				t.Errorf("atenetEgressRestartOnApply() = %v, want %v", got, tc.want)
 			}
 		})
 	}

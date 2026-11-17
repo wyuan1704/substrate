@@ -101,8 +101,10 @@ func mapTokenExchangeError(err error) error {
 // Any failure to produce a credential the request needs denies it, including
 // having no provider configured for a credential_uri entry. Actor JWTs and
 // token exchanges need no provider; policy is the actor's compiled policy,
-// which must allow each token exchange's endpoint.
-func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, headers map[string]string, policy *egresspolicy.Policy, effects *ateapi.HttpRuleEffects) ([]*corev3.HeaderValueOption, error) {
+// which must allow each token exchange's endpoint. decrypted is whether the
+// request arrived on the TLS-terminating leg, the only one an exchanged token
+// is injected on.
+func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, headers map[string]string, policy *egresspolicy.Policy, decrypted bool, effects *ateapi.HttpRuleEffects) ([]*corev3.HeaderValueOption, error) {
 	var injections []*ateapi.CredentialHeader
 	for _, inj := range effects.GetReplaceHeaders() {
 		if _, ok := headers[strings.ToLower(inj.GetHeader())]; ok {
@@ -132,7 +134,7 @@ func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest
 				return nil, fmt.Errorf("minting an actor JWT for header %s: %w", inj.GetHeader(), err)
 			}
 		case inj.GetTokenExchange() != nil:
-			secret, err = h.exchangedToken(ctx, ref, dest, policy, inj.GetTokenExchange())
+			secret, err = h.exchangedToken(ctx, ref, dest, policy, decrypted, inj.GetTokenExchange())
 			if err != nil {
 				return nil, fmt.Errorf("exchanging a token for header %s: %w", inj.GetHeader(), err)
 			}
@@ -174,9 +176,22 @@ func (h *Handler) actorJWT(ctx context.Context, ref resources.ActorRef, dest egr
 
 // exchangedToken exchanges an actor JWT for the access token src asks for.
 // Every error it returns is already a client-facing denial.
-func (h *Handler) exchangedToken(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, policy *egresspolicy.Policy, src *ateapi.TokenExchangeSource) ([]byte, error) {
+func (h *Handler) exchangedToken(ctx context.Context, ref resources.ActorRef, dest egresspolicy.Destination, policy *egresspolicy.Policy, decrypted bool, src *ateapi.TokenExchangeSource) ([]byte, error) {
+	// ateapi rejects token_exchange in http rules, so this only happens
+	// with a policy admitted by an older ateapi. Fail closed rather than send
+	// the token in cleartext.
+	if !decrypted {
+		slog.ErrorContext(ctx, "egress denied: token exchange on the cleartext leg",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("tokenURL", src.GetTokenUrl()))
+		return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
+	}
 	endpoint, ok := egresspolicy.TokenURLDestination(src.GetTokenUrl())
-	if !ok || !policy.EvaluateRequest(endpoint, true).Allowed {
+	if !ok {
+		slog.ErrorContext(ctx, "egress denied: token exchange URL is not a valid https URL",
+			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("tokenURL", src.GetTokenUrl()))
+		return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
+	}
+	if !policy.EvaluateRequest(endpoint, true).Allowed {
 		slog.ErrorContext(ctx, "egress denied: no https rule allows the token exchange endpoint",
 			slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("tokenURL", src.GetTokenUrl()))
 		return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)

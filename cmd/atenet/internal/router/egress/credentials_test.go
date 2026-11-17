@@ -486,12 +486,20 @@ func TestActorJWTInjectionDenials(t *testing.T) {
 func tokenEndpoint(t *testing.T, status int, body string) (string, *tokenexchange.Client, *atomic.Int32) {
 	t.Helper()
 	var calls atomic.Int32
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	tokenURL, client := tokenEndpointFunc(t, func(w http.ResponseWriter, _ *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
-	}))
+	})
+	return tokenURL, client, &calls
+}
+
+// tokenEndpointFunc starts a TLS token endpoint at localhost served by
+// handler. It returns the endpoint's token URL and a client that trusts it.
+func tokenEndpointFunc(t *testing.T, handler http.HandlerFunc) (string, *tokenexchange.Client) {
+	t.Helper()
+	srv := httptest.NewUnstartedServer(handler)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -526,7 +534,7 @@ func tokenEndpoint(t *testing.T, status int, body string) (string, *tokenexchang
 	if err != nil {
 		t.Fatal(err)
 	}
-	return "https://localhost:" + u.Port() + "/token", client, &calls
+	return "https://localhost:" + u.Port() + "/token", client
 }
 
 func tokenExchangeHeader(header, tokenURL string) *ateapi.CredentialHeader {
@@ -557,8 +565,12 @@ func tokenExchangePolicy(t *testing.T, leg, tokenURL string, entries ...*ateapi.
 	return policy
 }
 
+// Exchanged tokens are injected only on the TLS-terminating leg; see
+// TestTokenExchangeDeniedOnCleartextLeg.
+var tokenExchangeLegs = []string{extproc.EgressTLSMITMFilterChainName}
+
 func TestTokenExchangeInjection(t *testing.T) {
-	for _, leg := range requestLegs {
+	for _, leg := range tokenExchangeLegs {
 		t.Run(leg, func(t *testing.T) {
 			tokenURL, tokenClient, _ := tokenEndpoint(t, http.StatusOK, `{"access_token":"exchanged","expires_in":900}`)
 			client := &egressMockClient{actor: runningActor(), policy: tokenExchangePolicy(t, leg, tokenURL, tokenExchangeHeader("authorization", tokenURL))}
@@ -582,7 +594,7 @@ func TestTokenExchangeInjection(t *testing.T) {
 			want := &ateapi.MintActorJwtRequest{
 				Actor:             &ateapi.ObjectRef{Atespace: testEgressAtespace, Name: testEgressActor},
 				Audiences:         []string{"sts.example.com"},
-				ExpirationSeconds: 300,
+				ExpirationSeconds: 3600,
 			}
 			if got := client.lastMint.Load(); !proto.Equal(got, want) {
 				t.Errorf("MintActorJwt request = %v, want %v", got, want)
@@ -626,7 +638,7 @@ func TestTokenExchangeDenials(t *testing.T) {
 		{name: "ateapi unavailable", status: http.StatusOK, body: issued, mintErr: status.Error(codes.Unavailable, "ateapi is down"), want: envoy_type.StatusCode_ServiceUnavailable},
 		{name: "gateway may not mint", status: http.StatusOK, body: issued, mintErr: status.Error(codes.PermissionDenied, "denied"), want: envoy_type.StatusCode_InternalServerError},
 	}
-	for _, leg := range requestLegs {
+	for _, leg := range tokenExchangeLegs {
 		t.Run(leg, func(t *testing.T) {
 			for _, tc := range tests {
 				t.Run(tc.name, func(t *testing.T) {
@@ -664,4 +676,81 @@ func TestInjectionWithoutSourceDenied(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ateapi rejects token_exchange in http rules. A policy that has one anyway,
+// such as one admitted by an older ateapi, is denied on the cleartext leg
+// before anything is minted or exchanged, so the token never goes out in
+// cleartext.
+func TestTokenExchangeDeniedOnCleartextLeg(t *testing.T) {
+	tokenURL, tokenClient, exchanges := tokenEndpoint(t, http.StatusOK, `{"access_token":"exchanged"}`)
+	leg := extproc.EgressCleartextFilterChainName
+	client := &egressMockClient{actor: runningActor(), policy: tokenExchangePolicy(t, leg, tokenURL, tokenExchangeHeader("authorization", tokenURL))}
+	h := New(client, nil, 0, nil, tokenClient)
+	_, err := h.HandleRequestHeaders(context.Background(),
+		withAuthorization(innerMetadata(leg, "GET", "api.example.com", nil)))
+	wantStatus(t, err, envoy_type.StatusCode_InternalServerError)
+	if n := client.mintCalls.Load(); n != 0 {
+		t.Errorf("%d mints on the cleartext leg, want 0", n)
+	}
+	if n := exchanges.Load(); n != 0 {
+		t.Errorf("%d exchanges on the cleartext leg, want 0", n)
+	}
+}
+
+// A token endpoint that never answers must be a retryable 503 within the
+// 4-second injection budget, before Envoy's 5-second ext_proc message_timeout
+// turns it into a 504. The endpoint is a real server, so this runs in real
+// time.
+func TestTokenExchangeEndpointHangs(t *testing.T) {
+	release := make(chan struct{})
+	tokenURL, tokenClient := tokenEndpointFunc(t, func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+	// Registered after the server's Close, so it runs first and the hung
+	// handler can't hold up the close.
+	t.Cleanup(func() { close(release) })
+	leg := extproc.EgressTLSMITMFilterChainName
+	client := &egressMockClient{actor: runningActor(), policy: tokenExchangePolicy(t, leg, tokenURL, tokenExchangeHeader("authorization", tokenURL))}
+	h := New(client, nil, 0, nil, tokenClient)
+	start := time.Now()
+	_, err := h.HandleRequestHeaders(context.Background(),
+		withAuthorization(innerMetadata(leg, "GET", "api.example.com", nil)))
+	wantStatus(t, err, envoy_type.StatusCode_ServiceUnavailable)
+	if took := time.Since(start); took >= 5*time.Second {
+		t.Errorf("denied after %v, want under the 5s ext_proc message_timeout", took)
+	}
+}
+
+// A subject JWT mint that never answers is a 503 within the injection budget
+// too.
+func TestTokenExchangeMintHangs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		tokenClient, err := tokenexchange.New("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		const tokenURL = "https://sts.example.com/token"
+		leg := extproc.EgressTLSMITMFilterChainName
+		client := &egressMockClient{
+			actor:    runningActor(),
+			policy:   tokenExchangePolicy(t, leg, "https://sts.example.com:443/token", tokenExchangeHeader("authorization", tokenURL)),
+			mintGate: make(chan struct{}),
+		}
+		h := New(client, nil, 0, nil, tokenClient)
+		start := time.Now()
+		_, err = h.HandleRequestHeaders(context.Background(),
+			withAuthorization(innerMetadata(leg, "GET", "api.example.com", nil)))
+		wantStatus(t, err, envoy_type.StatusCode_ServiceUnavailable)
+		if took := time.Since(start); took >= 5*time.Second {
+			t.Errorf("denied after %v, want under the 5s ext_proc message_timeout", took)
+		}
+		// Let the broker's exchange time out before releasing the mint, so
+		// nothing goes on to dial the token URL.
+		time.Sleep(15 * time.Second)
+		close(client.mintGate)
+	})
 }

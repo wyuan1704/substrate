@@ -17,6 +17,7 @@ package steps
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -429,8 +430,9 @@ func patchAtenetEgressTokenExchangeCA(raw []byte, configMap string) ([]byte, err
 }
 
 // requireTokenExchangeCA fails when --token-exchange-ca-configmap names a
-// ConfigMap the install namespace lacks, or one without a ca.crt key, which
-// would leave the egress gateway unable to start.
+// ConfigMap the install namespace lacks, or one whose ca.crt is missing,
+// under binaryData, or holds no PEM certificate: the egress gateway loads it
+// as PEM and would not start.
 func (e *Env) requireTokenExchangeCA(ctx context.Context) error {
 	name := e.Cfg.TokenExchangeCAConfigMap
 	if name == "" {
@@ -444,10 +446,15 @@ func (e *Env) requireTokenExchangeCA(ctx context.Context) error {
 		return fmt.Errorf("token exchange CA ConfigMap %s/%s does not exist; create it with the CA certificates under key %s",
 			e.Namespace(), name, tokenExchangeCAKey)
 	}
-	_, inData := cm.Data[tokenExchangeCAKey]
-	_, inBinary := cm.BinaryData[tokenExchangeCAKey]
-	if !inData && !inBinary {
+	pem, inData := cm.Data[tokenExchangeCAKey]
+	if _, inBinary := cm.BinaryData[tokenExchangeCAKey]; inBinary && !inData {
+		return fmt.Errorf("token exchange CA ConfigMap %s/%s has %s under binaryData; put PEM certificates under data", e.Namespace(), name, tokenExchangeCAKey)
+	}
+	if !inData {
 		return fmt.Errorf("token exchange CA ConfigMap %s/%s has no %s key", e.Namespace(), name, tokenExchangeCAKey)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM([]byte(pem)) {
+		return fmt.Errorf("token exchange CA ConfigMap %s/%s key %s holds no PEM certificate", e.Namespace(), name, tokenExchangeCAKey)
 	}
 	return nil
 }
@@ -638,12 +645,20 @@ func (e *Env) applyAtenetEgress(ctx context.Context, providers []config.Credenti
 		return err
 	}
 
-	if running && (e.Cfg.AdditionalEgressExtprocService != "" || len(providers) > 0) {
+	if running && e.atenetEgressRestartOnApply(providers) {
 		if err := e.Kube.RolloutRestartDeployment(ctx, e.Namespace(), "atenet-egress", time.Now()); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// atenetEgressRestartOnApply reports whether a running atenet-egress must be
+// restarted after an apply, because it reads settings at startup that an
+// unchanged pod template would not roll: the external processors' config, and
+// the token exchange CA ConfigMap's content.
+func (e *Env) atenetEgressRestartOnApply(providers []config.CredentialProvider) bool {
+	return e.Cfg.AdditionalEgressExtprocService != "" || len(providers) > 0 || e.Cfg.TokenExchangeCAConfigMap != ""
 }
 
 // otelConfigPath returns the environment's ate-otel-config ConfigMap.
