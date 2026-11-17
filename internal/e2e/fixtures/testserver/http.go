@@ -94,9 +94,10 @@ const (
 )
 
 // exchangeToken answers an RFC 8693 token exchange whose audience is the
-// subject JWT's only aud with the access token "exchanged.<sub>.<scope>", so a
-// suite can see which actor and scope the gateway exchanged for. It does not
-// verify the JWT's signature.
+// subject JWT's only aud with the access token
+// "exchanged.<audience>.<sub>.<scope>", so a suite can see which audience,
+// actor, and scope the gateway exchanged for. It does not verify the JWT's
+// signature.
 func exchangeToken(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		oauthError(w, "invalid_request", err.Error())
@@ -124,13 +125,13 @@ func exchangeToken(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, "invalid_grant", fmt.Sprintf("decoding the subject_token payload: %v", err))
 		return
 	}
-	if len(claims.Aud) != 1 || claims.Aud[0] != form.Get("audience") {
+	if form.Get("audience") == "" || len(claims.Aud) != 1 || claims.Aud[0] != form.Get("audience") {
 		oauthError(w, "invalid_grant", fmt.Sprintf("subject_token aud %q is not [%q]", claims.Aud, form.Get("audience")))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]any{
-		"access_token":      "exchanged." + claims.Sub + "." + form.Get("scope"),
+		"access_token":      "exchanged." + form.Get("audience") + "." + claims.Sub + "." + form.Get("scope"),
 		"issued_token_type": tokenTypeAccessToken,
 		"token_type":        "Bearer",
 		"expires_in":        600,

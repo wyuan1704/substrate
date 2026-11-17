@@ -55,7 +55,10 @@ POOL="--name actor-id-jwt-pool --secret-namespace ate-system"
    curl -s "$ISSUER/openid/v1/jwks" | jq -r '.keys[].kid'
    ```
 
-   Then wait out the longest key set cache among your relying parties.
+   Then wait out the longest key set cache among your relying parties. A
+   relying party that holds an uploaded copy of the key set, such as a Google
+   Cloud provider created with `--jwk-json-path`, doesn't refetch it: upload
+   the key set to it again now, and again after step 6.
 
 4. Make the new key the signing key:
 

@@ -216,10 +216,11 @@ each step and what to do about a compromised key.
   receives the token. An upstream that echoes request headers hands the token
   back to the actor. A relying party should check `sub` or `actor.ate.dev` as
   well as `aud`.
-- **No cloud token exchange.** Cloud token exchange endpoints take the JWT as
-  a request parameter, and the gateway only replaces headers, so Substrate
-  can't yet trade an actor JWT for cloud credentials
-  ([#1661](https://github.com/agent-substrate/substrate/issues/1661)).
+- **Token exchange is limited.** The gateway can trade an actor JWT for an
+  access token at an RFC 8693 endpoint, such as Google Cloud STS (see
+  [Token exchange](egress-credential-injection.md#token-exchange)), but it
+  sends no client credentials, `actor_token`, or extra parameters, so
+  endpoints that need them aren't supported.
 - **A recreated actor can get a stale UID.** The gateway caches tokens by actor
   name. For up to two thirds of a token's lifetime after an actor is recreated,
   the gateway can inject a token whose `actorUID` names the old actor

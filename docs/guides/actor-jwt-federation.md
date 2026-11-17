@@ -57,8 +57,10 @@ Configure the relying party with:
 
 - The issuer, exactly as the discovery document names it.
 - The audience it expects. The egress policy's `actorJwt.audiences` has to
-  include it; see [Actor JWTs](egress-credential-injection.md#actor-jwts) in
-  the egress guide.
+  include it, or, for a token exchange endpoint, `tokenExchange.audience` has
+  to be it; see [Actor JWTs](egress-credential-injection.md#actor-jwts) and
+  [Token exchange](egress-credential-injection.md#token-exchange) in the
+  egress guide.
 - Authorization rules for the subjects that should have access. An actor's
   `sub` is `actor/<atespace>/<name>`.
 
@@ -67,6 +69,6 @@ If the relying party doesn't accept ES256,
 
 To check the setup, have an egress policy inject a token for the relying
 party's audience into a request to a server you control, and present that
-token to the relying party. Substrate can't yet present an actor JWT to a
-cloud token exchange endpoint itself; see
-[Known limitations](actor-jwts.md#known-limitations).
+token to the relying party. For a token exchange endpoint, such as Google
+Cloud STS, have the policy exchange the token with `tokenExchange` instead;
+see [Google Cloud Workload Identity Federation](egress-credential-injection.md#google-cloud-workload-identity-federation).

@@ -215,7 +215,10 @@ func TestHTTPHandlerExchangesTokens(t *testing.T) {
 		wantStatus int
 		wantBody   string
 	}{
-		{"issues a token naming the subject and scope", nil, http.StatusOK, `"access_token":"exchanged.actor/ns/a.read"`},
+		{"issues a token naming the audience, subject, and scope", nil, http.StatusOK, `"access_token":"exchanged.sts.example.actor/ns/a.read"`},
+		{"rejects an empty audience", func(v url.Values) { v.Set("audience", ""); v.Set("subject_token", jwt("actor/ns/a", "")) }, http.StatusBadRequest, `"error":"invalid_grant"`},
+		{"rejects another subject token type", func(v url.Values) { v.Set("subject_token_type", "urn:ietf:params:oauth:token-type:id_token") }, http.StatusBadRequest, `"error":"invalid_request"`},
+		{"rejects another requested token type", func(v url.Values) { v.Set("requested_token_type", tokenTypeJWT) }, http.StatusBadRequest, `"error":"invalid_request"`},
 		{"rejects another audience", func(v url.Values) { v.Set("audience", "other.example") }, http.StatusBadRequest, `"error":"invalid_grant"`},
 		{"rejects a JWT bound to more audiences", func(v url.Values) { v.Set("subject_token", jwt("actor/ns/a", "sts.example", "other.example")) }, http.StatusBadRequest, `"error":"invalid_grant"`},
 		{"rejects a subject_token that is not a JWT", func(v url.Values) { v.Set("subject_token", "opaque") }, http.StatusBadRequest, `"error":"invalid_grant"`},

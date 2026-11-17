@@ -57,15 +57,15 @@ var echoServer = e2e.ServiceDNSTLS(e2e.ServerPod{
 })
 
 // stsServer is a fake RFC 8693 token endpoint, testserver's POST /token, whose
-// /echoheaders also shows what the gateway injected. Its rules exchange actor
-// JWTs at its own /token, which its https rule allows.
+// /echoheaders also shows what the gateway injected. Its https rule exchanges
+// actor JWTs at its own /token, which that rule also allows.
 var stsServer = e2e.ServiceDNSTLS(e2e.ServerPod{
 	Name:       "sts",
 	ImportPath: "go.ate.dev/substrate/internal/e2e/fixtures/testserver",
 	Args:       []string{"http"},
 })
 
-// The sts rules replace exchangedTokenHeader with a token exchanged for
+// The sts https rule replaces exchangedTokenHeader with a token exchanged for
 // tokenExchangeAudience and tokenExchangeScope.
 const (
 	exchangedTokenHeader  = "X-Exchanged-Token"
@@ -198,23 +198,53 @@ func TestActorEgressCredentialInjection(t *testing.T) {
 		})
 	}
 
-	for _, scheme := range []string{"https", "http"} {
-		t.Run("token exchange/"+scheme, func(t *testing.T) {
-			origin := scheme + "://" + stsHost + "/echoheaders"
-			withExchangePlaceholder := []string{"header=" + url.QueryEscape(exchangedTokenHeader+":"+placeholder)}
-			if !e2e.CurrentAtenetDataplane().InjectsExchangedTokens() {
-				if got := probeFetch(t, ctx, rc, id, origin, withExchangePlaceholder); got.Status != "403" {
-					t.Errorf("fetch of %s returned status %q (error %q), want 403 from a dataplane without token exchange", origin, got.Status, got.Error)
-				}
-				return
+	withExchangePlaceholder := []string{"header=" + url.QueryEscape(exchangedTokenHeader+":"+placeholder)}
+	t.Run("token exchange/https", func(t *testing.T) {
+		origin := "https://" + stsHost + "/echoheaders"
+		if !e2e.CurrentAtenetDataplane().InjectsExchangedTokens() {
+			if got := probeFetch(t, ctx, rc, id, origin, withExchangePlaceholder); got.Status != "403" {
+				t.Errorf("fetch of %s returned status %q (error %q), want 403 from a dataplane without token exchange", origin, got.Status, got.Error)
 			}
-			echoed := assertEchoedHeaders(t, "token exchange fetch", fetchEcho(t, ctx, rc, id, origin, withExchangePlaceholder))
-			want := "Bearer exchanged.actor/" + probeNamespace + "/" + id + "." + tokenExchangeScope
-			if got := echoed[exchangedTokenHeader]; got != want {
-				t.Errorf("upstream received %s %q, want %q", exchangedTokenHeader, got, want)
-			}
+			return
+		}
+		echoed := assertEchoedHeaders(t, "token exchange fetch", fetchEcho(t, ctx, rc, id, origin, withExchangePlaceholder))
+		// The fake endpoint puts the audience it was sent into the token, so
+		// this also checks that the gateway sent the policy's audience.
+		want := "Bearer exchanged." + tokenExchangeAudience + ".actor/" + probeNamespace + "/" + id + "." + tokenExchangeScope
+		if got := echoed[exchangedTokenHeader]; got != want {
+			t.Errorf("upstream received %s %q, want %q", exchangedTokenHeader, got, want)
+		}
+	})
+
+	// The sts http rule has no effects, since ateapi rejects token_exchange
+	// in http rules: the placeholder goes out as the actor sent it.
+	t.Run("token exchange/http", func(t *testing.T) {
+		origin := "http://" + stsHost + "/echoheaders"
+		echoed := assertEchoedHeaders(t, "cleartext fetch", fetchEcho(t, ctx, rc, id, origin, withExchangePlaceholder))
+		if got := echoed[exchangedTokenHeader]; got != placeholder {
+			t.Errorf("upstream received %s %q over cleartext HTTP, want the actor's placeholder %q", exchangedTokenHeader, got, placeholder)
+		}
+	})
+
+	t.Run("token exchange in an http rule", func(t *testing.T) {
+		rule := e2e.EgressAllowHTTP(stsHost)
+		rule.Http.Effects = &ateapi.HttpRuleEffects{ReplaceHeaders: []*ateapi.CredentialHeader{
+			tokenExchangeInjection("https://" + stsHost + "/token"),
+		}}
+		// The actor does not exist, so a policy ateapi wrongly accepted
+		// would still not be stored.
+		ref := &ateapi.ObjectRef{Atespace: probeNamespace, Name: id + "-rejected"}
+		_, err := clients.SubstrateAPI.CreateActorEgressPolicy(ctx, &ateapi.CreateActorEgressPolicyRequest{
+			Actor: ref,
+			EgressPolicy: &ateapi.EgressPolicy{
+				Metadata: &ateapi.ResourceMetadata{Atespace: probeNamespace, Name: resources.SingletonName},
+				Rules:    []*ateapi.EgressRule{rule, e2e.EgressAllowHTTPS(stsHost)},
+			},
 		})
-	}
+		if status.Code(err) != codes.InvalidArgument {
+			t.Errorf("CreateActorEgressPolicy with token_exchange in an http rule: %v, want InvalidArgument", err)
+		}
+	})
 
 	t.Run("token URL no https rule allows", func(t *testing.T) {
 		rule := e2e.EgressAllowHTTPS(stsHost)
@@ -452,9 +482,13 @@ func createAndResumeActor(t *testing.T, ctx context.Context, clients *e2e.Client
 	echoHTTPSRule.Https.Effects.ReplaceHeaders = append(echoHTTPSRule.Https.Effects.ReplaceHeaders, actorJWTInjection())
 	echoHTTPRule := e2e.EgressInjectHeaderHTTP("Authorization", "Bearer ", e2e.CredentialInjectionURI, echoHost, echoHost+".cluster.local")
 	echoHTTPRule.Http.Effects.ReplaceHeaders = append(echoHTTPRule.Http.Effects.ReplaceHeaders, actorJWTInjection())
-	exchange := &ateapi.HttpRuleEffects{ReplaceHeaders: []*ateapi.CredentialHeader{tokenExchangeInjection("https://" + stsHost + "/token")}}
-	stsHTTPSRule, stsHTTPRule := e2e.EgressAllowHTTPS(stsHost), e2e.EgressAllowHTTP(stsHost)
-	stsHTTPSRule.Https.Effects, stsHTTPRule.Http.Effects = exchange, exchange
+	// Only the https rule exchanges: ateapi rejects token_exchange in an http
+	// rule. The .cluster.local name is what the actor's resolver asks for
+	// through the cluster DNS search path, and actor DNS answers only names a
+	// rule allows.
+	stsHosts := []string{stsHost, stsHost + ".cluster.local"}
+	stsHTTPSRule, stsHTTPRule := e2e.EgressAllowHTTPS(stsHosts...), e2e.EgressAllowHTTP(stsHosts...)
+	stsHTTPSRule.Https.Effects = &ateapi.HttpRuleEffects{ReplaceHeaders: []*ateapi.CredentialHeader{tokenExchangeInjection("https://" + stsHost + "/token")}}
 	rules := []*ateapi.EgressRule{echoHTTPSRule, echoHTTPRule, stsHTTPSRule, stsHTTPRule}
 	for _, credential := range []struct {
 		host string
