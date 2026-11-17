@@ -46,16 +46,23 @@ func testSource() *ateapi.TokenExchangeSource {
 	}
 }
 
-// fakeMinter's nth call returns "subject-<n>", or err when set.
+// fakeMinter's nth call returns "subject-<n>", or err when set. With hang
+// set, it instead blocks until its ctx ends and returns the bare ctx error,
+// as actorjwt.Minter does.
 type fakeMinter struct {
 	calls atomic.Int32
 	last  atomic.Pointer[ateapi.ActorJwtSource]
 	err   error
+	hang  bool
 }
 
-func (m *fakeMinter) Token(_ context.Context, _ resources.ActorRef, src *ateapi.ActorJwtSource) (string, error) {
+func (m *fakeMinter) Token(ctx context.Context, _ resources.ActorRef, src *ateapi.ActorJwtSource) (string, error) {
 	n := m.calls.Add(1)
 	m.last.Store(src)
+	if m.hang {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if m.err != nil {
 		return "", m.err
 	}
@@ -121,6 +128,8 @@ func TestTokenReuse(t *testing.T) {
 		{"until a third of the lifetime remains", `,"expires_in":900`, 600 * time.Second},
 		{"until 30 seconds remain", `,"expires_in":60`, 30 * time.Second},
 		{"for 60 seconds without expires_in", "", 60 * time.Second},
+		{"for at most an hour", `,"expires_in":86400`, time.Hour},
+		{"for at most an hour with the longest expires_in", `,"expires_in":9223372036854775807`, time.Hour},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -156,7 +165,7 @@ func TestExchangeSendsMintedSubjectToken(t *testing.T) {
 	minter, endpoint := &fakeMinter{}, &fakeEndpoint{}
 	mustToken(t, newTestBroker(minter, endpoint), testSource())
 
-	want := &ateapi.ActorJwtSource{Audiences: []string{"sts.example.com"}, ExpirationSeconds: 300}
+	want := &ateapi.ActorJwtSource{Audiences: []string{"sts.example.com"}, ExpirationSeconds: 3600}
 	if got := minter.last.Load(); !proto.Equal(got, want) {
 		t.Errorf("minted %v, want %v", got, want)
 	}
@@ -228,7 +237,18 @@ func TestHungExchangeTimesOut(t *testing.T) {
 		if _, err := b.Token(ctx, testActor, testSource()); err == nil {
 			t.Fatal("Token succeeded, want an error")
 		}
-		time.Sleep(exchangeTimeout)
+		// Just before the deadline, a new caller joins the stuck exchange
+		// rather than starting another.
+		time.Sleep(exchangeTimeout - 4*time.Second - time.Second)
+		ctx2, cancel2 := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancel2()
+		if _, err := b.Token(ctx2, testActor, testSource()); status.Code(err) != codes.DeadlineExceeded {
+			t.Fatalf("Token before the deadline: error = %v, want code DeadlineExceeded", err)
+		}
+		if n := endpoint.calls.Load(); n != 1 {
+			t.Fatalf("%d exchanges before the deadline, want 1", n)
+		}
+		time.Sleep(2 * time.Second)
 		close(endpoint.gate)
 		if got := mustToken(t, b, testSource()); got != "at-2" {
 			t.Errorf("token = %q, want at-2 from a new exchange", got)
@@ -297,4 +317,54 @@ func TestDoNotCacheErrors(t *testing.T) {
 	if got := mustToken(t, b, testSource()); got != "at-2" {
 		t.Errorf("token after a failed exchange = %q, want at-2", got)
 	}
+}
+
+// A mint that runs out the flight's time is DeadlineExceeded, which callers
+// retry, not the Unknown of a bare context error.
+func TestMintTimeoutIsDeadlineExceeded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		endpoint := &fakeEndpoint{}
+		b := newTestBroker(&fakeMinter{hang: true}, endpoint)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*exchangeTimeout)
+		defer cancel()
+		_, err := b.Token(ctx, testActor, testSource())
+		if !errors.Is(err, ErrMint) || status.Code(err) != codes.DeadlineExceeded {
+			t.Errorf("Token error = %v (code %v), want ErrMint with code DeadlineExceeded", err, status.Code(err))
+		}
+		if n := endpoint.calls.Load(); n != 0 {
+			t.Errorf("%d exchanges after a failed mint, want 0", n)
+		}
+	})
+}
+
+func TestDoNotCacheMintErrors(t *testing.T) {
+	minter := &fakeMinter{err: status.Error(codes.Unavailable, "ateapi unavailable")}
+	endpoint := &fakeEndpoint{expiresIn: `,"expires_in":900`}
+	b := newTestBroker(minter, endpoint)
+	if _, err := b.Token(t.Context(), testActor, testSource()); !errors.Is(err, ErrMint) {
+		t.Fatalf("Token error = %v, want ErrMint", err)
+	}
+	minter.err = nil
+	if got := mustToken(t, b, testSource()); got != "at-1" {
+		t.Errorf("token after a failed mint = %q, want at-1", got)
+	}
+	if n := minter.calls.Load(); n != 2 {
+		t.Errorf("%d mints, want 2", n)
+	}
+}
+
+func TestCallerCancelIsCanceled(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		endpoint := &fakeEndpoint{gate: make(chan struct{})}
+		b := newTestBroker(&fakeMinter{}, endpoint)
+		ctx, cancel := context.WithCancel(t.Context())
+		go func() {
+			synctest.Wait()
+			cancel()
+		}()
+		if _, err := b.Token(ctx, testActor, testSource()); status.Code(err) != codes.Canceled {
+			t.Errorf("Token error = %v, want code Canceled", err)
+		}
+		close(endpoint.gate)
+	})
 }

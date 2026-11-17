@@ -31,18 +31,26 @@ import (
 )
 
 const (
-	// subjectTokenSeconds is the subject JWT's lifetime, the least
-	// MintActorJwt accepts. Only the exchange uses it.
-	subjectTokenSeconds = 300
+	// subjectTokenSeconds is the subject JWT's lifetime, the most
+	// MintActorJwt accepts. Some endpoints, such as Google Cloud STS, end the
+	// exchanged token when the subject JWT expires, so a shorter lifetime
+	// would also shorten reuse. maxReuse still caps reuse at an hour.
+	subjectTokenSeconds = 3600
 	// exchangeTimeout bounds an exchange that has outlived its caller. Without
 	// it, an endpoint that never answers would hold the flight for its key
-	// forever.
+	// forever. It is deliberately longer than the gateway's 4-second injection
+	// timeout: a request gives up at 4 seconds, but an endpoint that takes
+	// longer still fills the cache for the requests after it.
 	exchangeTimeout = 10 * time.Second
 	// minReuseMargin is the least lifetime left at which a token stops being
 	// reused.
 	minReuseMargin = 30 * time.Second
 	// unknownExpiryReuse is how long a token without expires_in is reused.
 	unknownExpiryReuse = 60 * time.Second
+	// maxReuse is the longest any token is reused, however long it lives, so
+	// a revoked token or one cached for a since-deleted actor of the same
+	// name doesn't linger.
+	maxReuse = time.Hour
 )
 
 // ErrMint wraps a failure to mint the subject JWT, so callers can tell it from
@@ -56,8 +64,9 @@ type subjectMinter interface {
 
 // Broker exchanges actor JWTs for access tokens and reuses each access token
 // until a third of its lifetime, or 30 seconds, remains, whichever comes
-// first. Tokens are cached by actor name, so an actor recreated under the
-// same name can get its predecessor's token until then.
+// first, and for at most an hour. Tokens are cached per actor (atespace and
+// name, not UID), token URL, audience, and scopes, so an actor recreated
+// under the same name can get its predecessor's token until then.
 type Broker struct {
 	minter subjectMinter
 	client *Client
@@ -112,6 +121,12 @@ func (b *Broker) exchange(ctx context.Context, key string, ref resources.ActorRe
 		ExpirationSeconds: subjectTokenSeconds,
 	})
 	if err != nil {
+		// A minter that runs out of time can return a bare context error,
+		// whose gRPC code is Unknown. Give it its own code so callers can
+		// retry.
+		if _, ok := status.FromError(err); !ok && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+			err = status.FromContextError(err).Err()
+		}
 		return "", fmt.Errorf("%w: %w", ErrMint, err)
 	}
 	token, err := b.client.Exchange(ctx, src.GetTokenUrl(), subject, src.GetAudience(), scopes)
@@ -130,7 +145,7 @@ func reuseFor(token Token) time.Duration {
 		return unknownExpiryReuse
 	}
 	lifetime := time.Until(token.ExpiresAt)
-	return lifetime - max(lifetime/3, minReuseMargin)
+	return min(lifetime-max(lifetime/3, minReuseMargin), maxReuse)
 }
 
 func (b *Broker) cached(key string) (string, bool) {
