@@ -445,6 +445,7 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 	pattern := httpRule.Child("hostnames").Index(0)
 	ports := httpRule.Child("ports")
 	staticHeader := httpRule.Child("effects", "replace_headers").Index(0)
+	httpsHeader := rule.Child("https", "effects", "replace_headers").Index(0)
 	const badPattern = `must be a DNS hostname, optionally with a complete leftmost-label wildcard, or "*"`
 	validReq := func() *ateapi.CreateActorEgressPolicyRequest {
 		return &ateapi.CreateActorEgressPolicyRequest{
@@ -464,6 +465,13 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 	}
 	portNumbers := func(numbers ...int32) *ateapi.Ports { return &ateapi.Ports{Numbers: numbers} }
 	allPorts := func() *ateapi.Ports { return &ateapi.Ports{All: &ateapi.AllPorts{}} }
+	// tokenExchangeRule is an https rule for api.example.com that replaces h.
+	tokenExchangeRule := func(h *ateapi.CredentialHeader) *ateapi.EgressRule {
+		return &ateapi.EgressRule{Https: &ateapi.HttpsRule{
+			Hostnames: []string{"api.example.com"},
+			Effects:   &ateapi.HttpRuleEffects{ReplaceHeaders: []*ateapi.CredentialHeader{h}},
+		}}
+	}
 
 	tests := []struct {
 		name   string
@@ -988,33 +996,105 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 			field.Invalid(staticHeader.Child("actor_jwt", "expiration_seconds"), 3601, "").WithOrigin("maximum"),
 		},
 	}, {
+		name: "token exchange in an http rule",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
+			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
+		},
+		want: field.ErrorList{
+			field.Forbidden(staticHeader.Child("token_exchange"), ""),
+		},
+	}, {
+		name: "token exchanges in http rules count toward the limit",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules = []*ateapi.EgressRule{httpsRule(nil, "sts.example.com")}
+			for i := range 17 {
+				p.Rules = append(p.Rules, &ateapi.EgressRule{Http: &ateapi.HttpRule{
+					Hostnames: []string{fmt.Sprintf("api-%d.example.com", i)},
+					Effects:   &ateapi.HttpRuleEffects{ReplaceHeaders: []*ateapi.CredentialHeader{tokenExchangeHeader("https://sts.example.com/token")}},
+				}})
+			}
+		},
+		want: func() field.ErrorList {
+			var errs field.ErrorList
+			for i := range 17 {
+				errs = append(errs, field.Forbidden(rules.Index(i+1).Child("http", "effects", "replace_headers").Index(0).Child("token_exchange"), ""))
+			}
+			return append(errs, field.TooMany(rules, 17, 16))
+		}(),
+	}, {
+		name: "token exchange at an endpoint only a tls_passthrough rule allows",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
+			p.Rules = append(p.Rules, passthroughRule(portNumbers(443), "sts.example.com"))
+		},
+		want: field.ErrorList{
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
+		},
+	}, {
+		name: "token exchange at an endpoint an https rule on every port allows",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com:8443/token"))
+			p.Rules = append(p.Rules, httpsRule(allPorts(), "sts.example.com"))
+		},
+	}, {
+		name: "token exchange at an endpoint a * https rule allows",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
+			p.Rules = append(p.Rules, httpsRule(nil, "*"))
+		},
+	}, {
+		name: "token exchange at a non-default port a * https rule does not allow",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com:8443/token"))
+			p.Rules = append(p.Rules, httpsRule(nil, "*"))
+		},
+		want: field.ErrorList{
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
+		},
+	}, {
+		name: "token exchange at an uppercase, trailing-dot endpoint a lowercase https rule allows",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://STS.Example.com./token"))
+			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
+		},
+	}, {
+		name: "token exchange with an empty query",
+		mutate: func(p *ateapi.EgressPolicy) {
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token?"))
+			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
+		},
+		want: field.ErrorList{
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
+		},
+	}, {
 		name: "token exchange at an endpoint an https rule allows",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", "read", "https://www.googleapis.com/auth/cloud-platform")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", "read", "https://www.googleapis.com/auth/cloud-platform"))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 	}, {
 		name: "token exchange at an endpoint a wildcard https rule allows",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
 			p.Rules = append(p.Rules, httpsRule(nil, "*.example.com"))
 		},
 	}, {
 		name: "token exchange at an endpoint no rule allows",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader.Child("token_exchange", "token_url"), nil, ""),
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
 		},
 	}, {
 		name: "token exchange at an endpoint only an http rule allows",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
 			p.Rules = append(p.Rules, &ateapi.EgressRule{Http: &ateapi.HttpRule{Hostnames: []string{"sts.example.com"}, Ports: portNumbers(443)}})
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader.Child("token_exchange", "token_url"), nil, ""),
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
 		},
 	}, {
 		name: "token exchange on an https rule at an endpoint no rule allows",
@@ -1030,90 +1110,90 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 	}, {
 		name: "token exchange at an endpoint port an https rule allows",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com:8443/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com:8443/token"))
 			p.Rules = append(p.Rules, httpsRule(portNumbers(8443), "sts.example.com"))
 		},
 	}, {
 		name: "token exchange at an endpoint port the https rule does not allow",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com:8443/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com:8443/token"))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader.Child("token_exchange", "token_url"), nil, ""),
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
 		},
 	}, {
 		name: "token exchange over http",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("http://sts.example.com/token")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("http://sts.example.com/token"))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader.Child("token_exchange", "token_url"), nil, ""),
+			field.Invalid(httpsHeader.Child("token_exchange", "token_url"), nil, ""),
 		},
 	}, {
 		name: "token exchange with a long token URL",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/" + strings.Repeat("a", 2025))
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/" + strings.Repeat("a", 2025)))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.TooLong(staticHeader.Child("token_exchange", "token_url"), "", 2048).WithOrigin("maxLength"),
+			field.TooLong(httpsHeader.Child("token_exchange", "token_url"), "", 2048).WithOrigin("maxLength"),
 		},
 	}, {
 		name: "token exchange without a token URL",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader(""))
 		},
 		want: field.ErrorList{
-			field.Required(staticHeader.Child("token_exchange", "token_url"), ""),
+			field.Required(httpsHeader.Child("token_exchange", "token_url"), ""),
 		},
 	}, {
 		name: "token exchange without an audience",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
-			p.Rules[0].Http.Effects.ReplaceHeaders[0].TokenExchange.Audience = ""
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
+			p.Rules[0].Https.Effects.ReplaceHeaders[0].TokenExchange.Audience = ""
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Required(staticHeader.Child("token_exchange", "audience"), ""),
+			field.Required(httpsHeader.Child("token_exchange", "audience"), ""),
 		},
 	}, {
 		name: "token exchange with a long audience",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token")
-			p.Rules[0].Http.Effects.ReplaceHeaders[0].TokenExchange.Audience = strings.Repeat("a", 513)
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token"))
+			p.Rules[0].Https.Effects.ReplaceHeaders[0].TokenExchange.Audience = strings.Repeat("a", 513)
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.TooLong(staticHeader.Child("token_exchange", "audience"), "", 512).WithOrigin("maxLength"),
+			field.TooLong(httpsHeader.Child("token_exchange", "audience"), "", 512).WithOrigin("maxLength"),
 		},
 	}, {
 		name: "token exchange with a scope containing a space",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", "read write")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", "read write"))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader.Child("token_exchange", "scopes").Index(0), nil, ""),
+			field.Invalid(httpsHeader.Child("token_exchange", "scopes").Index(0), nil, ""),
 		},
 	}, {
 		name: "token exchange with an empty scope",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", "")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", ""))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.TooShort(staticHeader.Child("token_exchange", "scopes").Index(0), "", 1).WithOrigin("minLength"),
+			field.TooShort(httpsHeader.Child("token_exchange", "scopes").Index(0), "", 1).WithOrigin("minLength"),
 		},
 	}, {
 		name: "token exchange with a long scope",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", strings.Repeat("a", 257))
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", strings.Repeat("a", 257)))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.TooLong(staticHeader.Child("token_exchange", "scopes").Index(0), "", 256).WithOrigin("maxLength"),
+			field.TooLong(httpsHeader.Child("token_exchange", "scopes").Index(0), "", 256).WithOrigin("maxLength"),
 		},
 	}, {
 		name: "token exchange with too many scopes",
@@ -1122,20 +1202,20 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 			for i := range 17 {
 				scopes = append(scopes, fmt.Sprintf("scope-%d", i))
 			}
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", scopes...)
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", scopes...))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.TooMany(staticHeader.Child("token_exchange", "scopes"), 17, 16).WithOrigin("maxItems"),
+			field.TooMany(httpsHeader.Child("token_exchange", "scopes"), 17, 16).WithOrigin("maxItems"),
 		},
 	}, {
 		name: "token exchange with a repeated scope",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0] = tokenExchangeHeader("https://sts.example.com/token", "read", "read")
+			p.Rules[0] = tokenExchangeRule(tokenExchangeHeader("https://sts.example.com/token", "read", "read"))
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Duplicate(staticHeader.Child("token_exchange", "scopes").Index(1), "read"),
+			field.Duplicate(httpsHeader.Child("token_exchange", "scopes").Index(1), "read"),
 		},
 	}, {
 		name: "16 token exchanges",
@@ -1160,16 +1240,18 @@ func TestValidateEgressPolicyRules(t *testing.T) {
 			}
 		},
 		want: field.ErrorList{
-			field.Invalid(rules, nil, ""),
+			field.TooMany(rules, 17, 16),
 		},
 	}, {
 		name: "credential URI and token exchange in one header",
 		mutate: func(p *ateapi.EgressPolicy) {
-			p.Rules[0].Http.Effects.ReplaceHeaders[0].TokenExchange = tokenExchangeHeader("https://sts.example.com/token").TokenExchange
+			h := tokenExchangeHeader("https://sts.example.com/token")
+			h.CredentialUri = "ate-secret://kubernetes.io/provider/ns/name"
+			p.Rules[0] = tokenExchangeRule(h)
 			p.Rules = append(p.Rules, httpsRule(nil, "sts.example.com"))
 		},
 		want: field.ErrorList{
-			field.Invalid(staticHeader, nil, "one of").WithOrigin("union"),
+			field.Invalid(httpsHeader, nil, "one of").WithOrigin("union"),
 		},
 	}, {
 		name: "empty effects",

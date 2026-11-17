@@ -413,7 +413,9 @@ func NormalizeHostname(raw string) (string, bool) {
 // hostname and no userinfo, query, or fragment.
 func TokenURLDestination(raw string) (Destination, bool) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	// ForceQuery and the '#' check catch an empty query or fragment, which
+	// url.Parse otherwise drops.
+	if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.ForceQuery || strings.ContainsRune(raw, '#') {
 		return Destination{}, false
 	}
 	name, ok := NormalizeHostname(u.Hostname())

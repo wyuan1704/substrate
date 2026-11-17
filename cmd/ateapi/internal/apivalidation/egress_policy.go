@@ -93,7 +93,7 @@ func ValidateCustom_DeleteActorEgressPolicyRequest_Name(_ context.Context, _ ope
 // and a port, whatever their protocols: the gateway would have no way to pick
 // one. Defaults are applied before validation, so an http rule left on 80
 // and an https rule left on 443 never tie. It also rejects a token exchange
-// whose token_url no https rule allows.
+// in an http rule, and one whose token_url no https rule allows.
 func ValidateCustom_EgressPolicy_Rules(_ context.Context, _ operation.Operation, p *field.Path, rules, _ []*ateapi.EgressRule) field.ErrorList {
 	type key struct {
 		pattern string
@@ -137,27 +137,36 @@ func validateTokenURLsAllowed(p *field.Path, rules []*ateapi.EgressRule) field.E
 		raw  string
 	}
 	var urls []tokenURL
+	var errs field.ErrorList
+	exchanges := 0
 	for i, rule := range rules {
-		member, effects := "http", rule.GetHttp().GetEffects()
-		if rule.GetHttps() != nil {
-			member, effects = "https", rule.GetHttps().GetEffects()
+		// An http rule's headers leave the gateway in cleartext, so the
+		// exchanged token, often a broad cloud credential, would too.
+		for j, inj := range rule.GetHttp().GetEffects().GetReplaceHeaders() {
+			if inj.GetTokenExchange() != nil {
+				exchanges++
+				path := p.Index(i).Child("http", "effects", "replace_headers").Index(j).Child("token_exchange")
+				errs = append(errs, field.Forbidden(path, "token_exchange is allowed only in https rules, so the exchanged token is never sent in cleartext"))
+			}
 		}
-		for j, inj := range effects.GetReplaceHeaders() {
+		for j, inj := range rule.GetHttps().GetEffects().GetReplaceHeaders() {
 			if src := inj.GetTokenExchange(); src != nil {
-				path := p.Index(i).Child(member, "effects", "replace_headers").Index(j).Child("token_exchange", "token_url")
+				exchanges++
+				path := p.Index(i).Child("https", "effects", "replace_headers").Index(j).Child("token_exchange", "token_url")
 				urls = append(urls, tokenURL{path, src.GetTokenUrl()})
 			}
 		}
 	}
-	if len(urls) > maxTokenExchanges {
-		return field.ErrorList{field.Invalid(p, len(urls), fmt.Sprintf("at most %d replace_headers entries may set token_exchange", maxTokenExchanges))}
+	if exchanges > maxTokenExchanges {
+		tooMany := field.TooMany(p, exchanges, maxTokenExchanges)
+		tooMany.Detail = fmt.Sprintf("at most %d replace_headers entries may set token_exchange", maxTokenExchanges)
+		return append(errs, tooMany)
 	}
 	if len(urls) == 0 {
-		return nil
+		return errs
 	}
 	// Invalid patterns are reported by the hostname checks.
 	policy, _ := egresspolicy.Compile(&ateapi.EgressPolicy{Rules: rules})
-	var errs field.ErrorList
 	for _, u := range urls {
 		dest, ok := egresspolicy.TokenURLDestination(u.raw)
 		if !ok {

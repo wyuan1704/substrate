@@ -114,11 +114,18 @@ func (h *Handler) applyEffects(ctx context.Context, ref resources.ActorRef, dest
 			slog.ErrorContext(ctx, "egress denied: token exchange is not supported by this gateway",
 				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("header", inj.GetHeader()))
 			return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
-		default:
+		case inj.GetCredentialUri() != "":
 			secret, err = h.providerCredential(ctx, ref, dest, inj.GetCredentialUri())
 			if err != nil {
 				return nil, fmt.Errorf("fetching credential %s for header %s: %w", inj.GetCredentialUri(), inj.GetHeader(), err)
 			}
+		default:
+			// A source this gateway doesn't know, such as one added to the
+			// API after it was built. Never fall through to the provider with
+			// an empty URI.
+			slog.ErrorContext(ctx, "egress denied: policy names no supported credential source",
+				slog.Any("actor", ref), slog.String("host", dest.Hostname), slog.String("header", inj.GetHeader()))
+			return nil, extproc.NewReqError(envoy_type.StatusCode_InternalServerError, deniedBody)
 		}
 
 		// Overwrite any header the actor set itself, so a client cannot pre-seed a

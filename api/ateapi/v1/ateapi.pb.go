@@ -1335,7 +1335,7 @@ type EgressPolicy struct {
 	// +k8s:optional
 	// +k8s:maxItems=256
 	// +k8s:listType=atomic
-	// +k8s:customValidation # no two rules tie on a name and port, and an https rule allows each token_url
+	// +k8s:customValidation # no two rules tie on a name and port, token_exchange is only in https rules, and an https rule allows each token_url
 	Rules         []*EgressRule `protobuf:"bytes,2,rep,name=rules,proto3" json:"rules,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1397,7 +1397,7 @@ type EgressPolicyTemplate struct {
 	// +k8s:required
 	// +k8s:maxItems=256
 	// +k8s:listType=atomic
-	// +k8s:customValidation # no two rules tie on a name and port, and an https rule allows each token_url
+	// +k8s:customValidation # no two rules tie on a name and port, token_exchange is only in https rules, and an https rule allows each token_url
 	Rules         []*EgressRule `protobuf:"bytes,1,rep,name=rules,proto3" json:"rules,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1883,12 +1883,13 @@ type HttpRuleEffects struct {
 	// the requests that ask for it. Header names must be unique
 	// case-insensitively.
 	//
-	// Replacement is supported on HTTP and HTTPS. On HTTP, the gateway does
-	// not originate TLS to the destination. Without separate transport
-	// protection, observers can read the credential and attackers on the path
-	// can modify the request. Deployments may encrypt traffic outside the
-	// gateway; policy authors must account for any unprotected segments
-	// between credential injection and the intended destination.
+	// Replacement is supported on HTTP and HTTPS, except token_exchange, which
+	// is HTTPS only. On HTTP, the gateway does not originate TLS to the
+	// destination. Without separate transport protection, observers can read
+	// the credential and attackers on the path can modify the request.
+	// Deployments may encrypt traffic outside the gateway; policy authors must
+	// account for any unprotected segments between credential injection and
+	// the intended destination.
 	//
 	// +k8s:optional
 	// +k8s:maxItems=16
@@ -1973,8 +1974,10 @@ type CredentialHeader struct {
 	// +k8s:unionMember
 	ActorJwt *ActorJwtSource `protobuf:"bytes,4,opt,name=actor_jwt,json=actorJwt,proto3" json:"actor_jwt,omitempty"`
 	// An access token obtained by exchanging an actor JWT at an OAuth 2.0
-	// token exchange endpoint (RFC 8693). A policy can have at most 16
-	// token_exchange entries.
+	// token exchange endpoint (RFC 8693). Allowed only in an https rule's
+	// effects, so the exchanged token never leaves the gateway in cleartext; an
+	// http rule with a token_exchange entry is rejected. A policy can have at
+	// most 16 token_exchange entries.
 	//
 	// +k8s:optional
 	// +k8s:unionMember

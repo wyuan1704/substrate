@@ -484,3 +484,20 @@ func TestTokenExchangeInjectionDenied(t *testing.T) {
 		})
 	}
 }
+
+// An entry with no source this gateway knows denies instead of asking the
+// provider for an empty credential_uri.
+func TestInjectionWithoutSourceDenied(t *testing.T) {
+	for _, leg := range requestLegs {
+		t.Run(leg, func(t *testing.T) {
+			provider := &fakeProvider{resp: bearerTokenResponse("s3cr3t")}
+			h := injectionHandlerFor(replaceHeadersPolicy(leg, &ateapi.CredentialHeader{Header: "authorization"}), provider, "")
+			_, err := h.HandleRequestHeaders(context.Background(),
+				withAuthorization(innerMetadata(leg, "GET", "api.example.com", nil)))
+			wantStatus(t, err, envoy_type.StatusCode_InternalServerError)
+			if provider.got != nil {
+				t.Errorf("provider was asked for %v, want no fetch", provider.got)
+			}
+		})
+	}
+}
