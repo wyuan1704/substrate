@@ -27,6 +27,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc/codes"
@@ -126,19 +127,26 @@ func TestExchangeReturnsToken(t *testing.T) {
 	for _, tt := range []struct {
 		name          string
 		body          string
-		wantToken     string // ya29.token unless set
+		wantToken     string // fake.access.token unless set
 		wantExpiresIn time.Duration
 	}{{
 		name:          "with expires_in",
-		body:          `{"access_token":"ya29.token","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":600}`,
+		body:          `{"access_token":"fake.access.token","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":600}`,
 		wantExpiresIn: 600 * time.Second,
 	}, {
 		name: "without expires_in or issued_token_type",
-		body: `{"access_token":"ya29.token","token_type":"Bearer"}`,
+		body: `{"access_token":"fake.access.token","token_type":"Bearer"}`,
+	}, {
+		name:          "with an expires_in too large for a Duration",
+		body:          `{"access_token":"fake.access.token","expires_in":9223372036854775807}`,
+		wantExpiresIn: maxExpiresIn * time.Second,
 	}, {
 		name:      "with a space in access_token",
-		body:      `{"access_token":"ya29 token"}`,
-		wantToken: "ya29 token",
+		body:      `{"access_token":"fake access token"}`,
+		wantToken: "fake access token",
+	}, {
+		name: "with token_type in another case",
+		body: `{"access_token":"fake.access.token","token_type":"bearer"}`,
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			srv, c := newTestServer(t, respond(http.StatusOK, tt.body))
@@ -150,7 +158,7 @@ func TestExchangeReturnsToken(t *testing.T) {
 			}
 			want := tt.wantToken
 			if want == "" {
-				want = "ya29.token"
+				want = "fake.access.token"
 			}
 			if tok.AccessToken != want {
 				t.Errorf("AccessToken = %q, want %q", tok.AccessToken, want)
@@ -182,7 +190,9 @@ func TestExchangeErrors(t *testing.T) {
 		{"invalid_target", http.StatusBadRequest, oauthError("invalid_target"), codes.PermissionDenied},
 		{"unauthorized_client", http.StatusUnauthorized, oauthError("unauthorized_client"), codes.PermissionDenied},
 		{"invalid_scope", http.StatusBadRequest, oauthError("invalid_scope"), codes.PermissionDenied},
-		{"access_denied", http.StatusBadRequest, oauthError("access_denied"), codes.PermissionDenied},
+		{"403 access_denied", http.StatusForbidden, oauthError("access_denied"), codes.PermissionDenied},
+		{"403 without an error code", http.StatusForbidden, "forbidden", codes.PermissionDenied},
+		{"access_denied, an authorization endpoint code", http.StatusBadRequest, oauthError("access_denied"), codes.FailedPrecondition},
 		{"invalid_request", http.StatusBadRequest, oauthError("invalid_request"), codes.FailedPrecondition},
 		{"invalid_client", http.StatusUnauthorized, oauthError("invalid_client"), codes.FailedPrecondition},
 		{"unsupported_grant_type", http.StatusBadRequest, oauthError("unsupported_grant_type"), codes.FailedPrecondition},
@@ -197,6 +207,10 @@ func TestExchangeErrors(t *testing.T) {
 		{"200 with a control character in access_token", http.StatusOK, `{"access_token":"at\r\nX-Injected: 1"}`, codes.Unavailable},
 		{"200 with non-ASCII in access_token", http.StatusOK, `{"access_token":"atÿ"}`, codes.Unavailable},
 		{"200 with DEL in access_token", http.StatusOK, `{"access_token":"at\u007f"}`, codes.Unavailable},
+		{"200 with token_type DPoP", http.StatusOK, `{"access_token":"at","token_type":"DPoP"}`, codes.Unavailable},
+		{"200 with token_type N_A", http.StatusOK, `{"access_token":"at","token_type":"N_A"}`, codes.Unavailable},
+		{"200 with a zero expires_in", http.StatusOK, `{"access_token":"at","expires_in":0}`, codes.Unavailable},
+		{"200 with a negative expires_in", http.StatusOK, `{"access_token":"at","expires_in":-5}`, codes.Unavailable},
 		{"200 over 1 MiB", http.StatusOK, `{"access_token":"at"}` + strings.Repeat(" ", maxResponseBytes), codes.Unavailable},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -273,6 +287,65 @@ func TestExchangeHonorsContextDeadline(t *testing.T) {
 	}
 }
 
+func TestExchangeCanceledContext(t *testing.T) {
+	srv, c := newTestServer(t, respond(http.StatusOK, `{"access_token":"at"}`))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := c.Exchange(ctx, srv.URL+"/token", subjectToken, audience, nil)
+	if got := status.Code(err); got != codes.Canceled {
+		t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.Canceled)
+	}
+}
+
+// stallingServer starts a server that sends a 200 status line and headers,
+// then stalls before the body until the test ends. headersSent is closed once
+// the headers are flushed. The handler ignores the request's context: ending
+// the response when the client hangs up could hand the client a complete,
+// empty body instead of the error under test.
+func stallingServer(t *testing.T) (srv *httptest.Server, c *Client, headersSent <-chan struct{}) {
+	t.Helper()
+	sent := make(chan struct{})
+	release := make(chan struct{})
+	srv, c = newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(sent)
+		<-release
+	})
+	// Registered after newTestServer's srv.Close, so it runs first and an
+	// unfinished handler can't block the close.
+	t.Cleanup(func() { close(release) })
+	return srv, c, sent
+}
+
+func TestExchangeContextEndsDuringBodyRead(t *testing.T) {
+	t.Run("deadline", func(t *testing.T) {
+		srv, c, _ := stallingServer(t)
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		defer cancel()
+		_, err := c.Exchange(ctx, srv.URL+"/token", subjectToken, audience, nil)
+		if got := status.Code(err); got != codes.DeadlineExceeded {
+			t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.DeadlineExceeded)
+		}
+	})
+	t.Run("cancel", func(t *testing.T) {
+		srv, c, headersSent := stallingServer(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go func() {
+			<-headersSent
+			// Give the client time to return from Do and block reading the body.
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		_, err := c.Exchange(ctx, srv.URL+"/token", subjectToken, audience, nil)
+		if got := status.Code(err); got != codes.Canceled {
+			t.Errorf("Exchange error = %v (code %v), want code %v", err, got, codes.Canceled)
+		}
+	})
+}
+
 func TestExchangeUnreachableEndpoint(t *testing.T) {
 	srv, c := newTestServer(t, respond(http.StatusOK, `{"access_token":"at"}`))
 	srv.Close()
@@ -310,6 +383,34 @@ func TestNewRejectsUnusableCAFile(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			if _, err := New(path); err == nil {
 				t.Errorf("New(%q) succeeded, want an error", path)
+			}
+		})
+	}
+}
+
+func TestClipKeepsUTF8Valid(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		in   string
+		want string
+	}{{
+		// "é" is 2 bytes, so after the 1-byte "x" the byte limit falls
+		// inside a character, which clip must drop whole.
+		name: "cut lands mid-character",
+		in:   "x" + strings.Repeat("é", maxDetailBytes),
+		want: "x" + strings.Repeat("é", (maxDetailBytes-1)/2),
+	}, {
+		name: "invalid bytes are replaced",
+		in:   "bad \xff\xfe bytes",
+		want: "bad \ufffd bytes",
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clip(tt.in)
+			if !utf8.ValidString(got) || len(got) > maxDetailBytes {
+				t.Errorf("clip(%q) = %q (%d bytes), want valid UTF-8 within %d bytes", tt.in, got, len(got), maxDetailBytes)
+			}
+			if got != tt.want {
+				t.Errorf("clip(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
 	}
